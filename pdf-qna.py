@@ -1,57 +1,86 @@
 # pdf_qa_cli.py
 import os
+import json
+import shutil
 from dotenv import load_dotenv
-load_dotenv(override=True)  # load .env file if exists
+load_dotenv(override=True)
 
-# 1) LangChain + Google GenAI imports
 from langchain_community.document_loaders.pdf import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-# LangChain<->Google wrapper
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-# chain helper (simple QA)
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.chains import RetrievalQA
 
 # ------------- CONFIG -------------
-PDF_PATH = "NIPS-2017-attention-is-all-you-need-Paper.pdf"            # <-- change to your file
-CHROMA_PERSIST = "chroma_db"      # local persistence dir
+PDF_PATH = "NIPS-2017-attention-is-all-you-need-Paper.pdf"
+CHROMA_PERSIST = "chroma_db"
+METADATA_FILE = os.path.join(CHROMA_PERSIST, "metadata.json")
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
-TOP_K = 4                         # number of chunks to retrieve
+TOP_K = 4
+EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "google").lower()
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
 # ----------------------------------
 
-# 0) sanity check env
-if not os.getenv("GOOGLE_API_KEY"):
-    raise SystemExit("Set GOOGLE_API_KEY (see Google AI Studio) before running.")
+if EMBEDDING_BACKEND == "google" and not os.getenv("GOOGLE_API_KEY"):
+    raise SystemExit("Set GOOGLE_API_KEY before running.")
 
-# 1) load PDF
+print(f"Embedding backend: {EMBEDDING_BACKEND}")
+if EMBEDDING_BACKEND == "google":
+    print(f"Using Google embedding model: {EMBEDDING_MODEL}")
+
+# 1) Load PDF
 loader = PyPDFLoader(PDF_PATH)
-documents = loader.load()   # list of Document objects (each page usually)
+documents = loader.load()
 
-# 2) split into chunks
+# 2) Split into chunks
 splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-chunks = splitter.split_documents(documents)   # list[Document]
-
+chunks = splitter.split_documents(documents)
 print(f"Loaded {len(documents)} pages → {len(chunks)} chunks")
 
-# 3) embeddings using Gemini embedding model
-embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")  # or omit model to use default
+# 3) Select embeddings
+if EMBEDDING_BACKEND == "google":
+    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+elif EMBEDDING_BACKEND == "default":
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+else:
+    raise ValueError(f"Unsupported EMBEDDING_BACKEND: {EMBEDDING_BACKEND}")
 
-# 4) create or load Chroma vectorstore
-if not os.path.exists(CHROMA_PERSIST):
+# 4) Check metadata to see if DB matches current settings
+def needs_rebuild():
+    if not os.path.exists(METADATA_FILE):
+        return True
+    try:
+        with open(METADATA_FILE, "r") as f:
+            meta = json.load(f)
+        return meta.get("backend") != EMBEDDING_BACKEND or meta.get("model") != EMBEDDING_MODEL
+    except Exception:
+        return True
+
+def save_metadata():
+    os.makedirs(CHROMA_PERSIST, exist_ok=True)
+    with open(METADATA_FILE, "w") as f:
+        json.dump({"backend": EMBEDDING_BACKEND, "model": EMBEDDING_MODEL}, f)
+
+# 5) Create or load Chroma DB
+if needs_rebuild():
+    if os.path.exists(CHROMA_PERSIST):
+        shutil.rmtree(CHROMA_PERSIST)
     db = Chroma.from_documents(chunks, embeddings, persist_directory=CHROMA_PERSIST)
+    save_metadata()
     print("Built and persisted Chroma DB.")
 else:
     db = Chroma(persist_directory=CHROMA_PERSIST, embedding_function=embeddings)
     print("Loaded Chroma DB from disk.")
 
-# 5) retriever
+# 6) Retriever
 retriever = db.as_retriever(search_kwargs={"k": TOP_K})
 
-# 6) LLM (Gemini chat)
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")  # pick the model you want
+# 7) LLM
+llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
 
-# 7) build a simple RetrievalQA chain
+# 8) RetrievalQA chain
 qa = RetrievalQA.from_chain_type(
     llm=llm,
     chain_type="stuff",
@@ -59,7 +88,7 @@ qa = RetrievalQA.from_chain_type(
     return_source_documents=True
 )
 
-# 8) CLI loop
+# 9) CLI loop
 print("PDF Q&A CLI ready. Type a question (or 'exit').")
 while True:
     q = input("> ").strip()
@@ -69,7 +98,6 @@ while True:
     answer = res["result"] if isinstance(res, dict) else res
     print("\n== Answer ==\n")
     print(answer)
-    # show sources if available
     if isinstance(res, dict) and res.get("source_documents"):
         print("\n-- Source documents (top chunks) --")
         for d in res["source_documents"]:
